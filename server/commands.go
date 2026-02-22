@@ -145,6 +145,7 @@ func (p *Plugin) cmdList() (*model.CommandResponse, *model.AppError) {
 		return ephemeral("Ресурсы не настроены. Администратор может добавить их через GUI плагина."), nil
 	}
 
+	pluginURL := p.getPluginURL()
 	attachments := make([]*model.SlackAttachment, 0, len(resources))
 
 	for _, r := range resources {
@@ -156,86 +157,61 @@ func (p *Plugin) cmdList() (*model.CommandResponse, *model.AppError) {
 		booking, _ := p.store.GetBooking(r.ID)
 		queue, _ := p.store.GetQueue(r.ID)
 
-		var status, color string
-		fields := []*model.SlackAttachmentField{}
-
-		if r.IP != "" {
-			fields = append(fields, &model.SlackAttachmentField{
-				Title: "IP", Value: "`" + r.IP + "`", Short: true,
-			})
-		}
+		var line, color string
 
 		if booking != nil {
 			timeLeft := time.Until(booking.ExpiresAt)
-			status = fmt.Sprintf("🔴 Занят @%s (осталось %s)", p.getUsername(booking.UserID), formatTimeLeft(timeLeft))
-			color = "#e53935"
+			purpose := ""
 			if booking.Purpose != "" {
-				fields = append(fields, &model.SlackAttachmentField{
-					Title: "Цель", Value: booking.Purpose, Short: true,
-				})
+				purpose = fmt.Sprintf(" · _%s_", booking.Purpose)
 			}
+			queueInfo := ""
+			if len(queue.Entries) > 0 {
+				queueInfo = fmt.Sprintf(" · 👥%d", len(queue.Entries))
+			}
+			line = fmt.Sprintf("%s **%s** `%s` · 🔴 @%s ⏱%s%s%s",
+				icon, r.Name, r.IP, p.getUsername(booking.UserID), formatTimeLeft(timeLeft), purpose, queueInfo)
+			color = "#e53935"
 		} else {
-			status = "🟢 Свободен"
+			line = fmt.Sprintf("%s **%s** `%s` · 🟢 Свободен", icon, r.Name, r.IP)
 			color = "#4caf50"
 		}
 
-		if len(queue.Entries) > 0 {
-			status += fmt.Sprintf(" | 👥 Очередь: %d", len(queue.Entries))
-		}
-
-		fields = append(fields, &model.SlackAttachmentField{
-			Title: "Статус", Value: status, Short: false,
-		})
-
 		actions := []*model.PostAction{}
 		if booking == nil {
-			actions = append(actions, &model.PostAction{
-				Id:   "book_10_" + r.ID,
-				Name: "⚡ Занять 10м",
-				Type: "button",
-				Integration: &model.PostActionIntegration{
-					URL: fmt.Sprintf("/plugins/com.scientia.resource-queue/api/v1/action/book"),
-					Context: map[string]interface{}{
-						"resource_id": r.ID,
-						"minutes":     10,
-					},
-				},
-			},
+			actions = append(actions,
 				&model.PostAction{
-					Id:   "book_60_" + r.ID,
-					Name: "🔒 Занять 1ч",
-					Type: "button",
+					Id: "b10_" + r.ID, Name: "⚡10м", Type: "button",
 					Integration: &model.PostActionIntegration{
-						URL: fmt.Sprintf("/plugins/com.scientia.resource-queue/api/v1/action/book"),
-						Context: map[string]interface{}{
-							"resource_id": r.ID,
-							"minutes":     60,
-						},
-					},
-				})
-		} else {
-			actions = append(actions, &model.PostAction{
-				Id:   "queue_" + r.ID,
-				Name: "📋 В очередь",
-				Type: "button",
-				Integration: &model.PostActionIntegration{
-					URL: fmt.Sprintf("/plugins/com.scientia.resource-queue/api/v1/action/queue"),
-					Context: map[string]interface{}{
-						"resource_id": r.ID,
-						"minutes":     60,
+						URL:     pluginURL + "/action/book",
+						Context: map[string]interface{}{"resource_id": r.ID, "minutes": 10},
 					},
 				},
-			})
+				&model.PostAction{
+					Id: "b60_" + r.ID, Name: "🔒1ч", Type: "button",
+					Integration: &model.PostActionIntegration{
+						URL:     pluginURL + "/action/book",
+						Context: map[string]interface{}{"resource_id": r.ID, "minutes": 60},
+					},
+				},
+			)
+		} else {
+			actions = append(actions,
+				&model.PostAction{
+					Id: "q_" + r.ID, Name: "📋Очередь 1ч", Type: "button",
+					Integration: &model.PostActionIntegration{
+						URL:     pluginURL + "/action/queue",
+						Context: map[string]interface{}{"resource_id": r.ID, "minutes": 60},
+					},
+				},
+			)
 		}
 
-		att := &model.SlackAttachment{
-			Title:   icon + " " + r.Name,
-			Text:    r.Description,
+		attachments = append(attachments, &model.SlackAttachment{
+			Text:    line,
 			Color:   color,
-			Fields:  fields,
 			Actions: actions,
-		}
-		attachments = append(attachments, att)
+		})
 	}
 
 	return &model.CommandResponse{

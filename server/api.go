@@ -12,6 +12,7 @@ import (
 )
 
 func (p *Plugin) setupAPI() {
+	// Authenticated API routes
 	s := p.router.PathPrefix("/api/v1").Subrouter()
 	s.Use(p.authMiddleware)
 
@@ -45,9 +46,9 @@ func (p *Plugin) setupAPI() {
 	// Presets
 	s.HandleFunc("/presets", p.handleGetPresets).Methods("GET")
 
-	// Interactive button actions
-	s.HandleFunc("/action/book", p.handleActionBook).Methods("POST")
-	s.HandleFunc("/action/queue", p.handleActionQueue).Methods("POST")
+	// Interactive button actions (NO auth middleware — Mattermost server calls these directly)
+	p.router.HandleFunc("/action/book", p.handleActionBook).Methods("POST")
+	p.router.HandleFunc("/action/queue", p.handleActionQueue).Methods("POST")
 }
 
 func (p *Plugin) authMiddleware(next http.Handler) http.Handler {
@@ -542,42 +543,35 @@ func (p *Plugin) handleGetPresets(w http.ResponseWriter, r *http.Request) {
 
 // --- Interactive Button Actions ---
 
-type ActionRequest struct {
-	UserID  string                 `json:"user_id"`
-	Context map[string]interface{} `json:"context"`
-}
-
 func (p *Plugin) handleActionBook(w http.ResponseWriter, r *http.Request) {
-	var req ActionRequest
+	var req model.PostActionIntegrationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondJSON(w, map[string]string{"ephemeral_text": "Ошибка: " + err.Error()})
+		p.API.LogError("Action book: bad request", "error", err.Error())
+		respondJSON(w, &model.PostActionIntegrationResponse{EphemeralText: "Ошибка: неверный запрос"})
 		return
 	}
 
-	userID := req.UserID
-	if userID == "" {
-		userID = r.Header.Get("Mattermost-User-ID")
-	}
-
+	userID := req.UserId
 	resourceID, _ := req.Context["resource_id"].(string)
 	minutesFloat, _ := req.Context["minutes"].(float64)
 	minutes := int(minutesFloat)
 
-	if resourceID == "" || minutes <= 0 {
-		respondJSON(w, map[string]string{"ephemeral_text": "Неверные параметры"})
+	if resourceID == "" || minutes <= 0 || userID == "" {
+		respondJSON(w, &model.PostActionIntegrationResponse{EphemeralText: "Ошибка: неверные параметры"})
 		return
 	}
 
 	res, err := p.store.GetResource(resourceID)
 	if err != nil || res == nil {
-		respondJSON(w, map[string]string{"ephemeral_text": "Ресурс не найден"})
+		respondJSON(w, &model.PostActionIntegrationResponse{EphemeralText: "Ресурс не найден"})
 		return
 	}
 
 	existing, _ := p.store.GetBooking(resourceID)
 	if existing != nil {
-		respondJSON(w, map[string]string{
-			"ephemeral_text": fmt.Sprintf("🔴 **%s** уже занят @%s", res.Name, p.getUsername(existing.UserID)),
+		respondJSON(w, &model.PostActionIntegrationResponse{
+			EphemeralText: fmt.Sprintf("🔴 **%s** уже занят @%s. Используйте `/rq queue %s 1h`",
+				res.Name, p.getUsername(existing.UserID), res.Name),
 		})
 		return
 	}
@@ -589,7 +583,7 @@ func (p *Plugin) handleActionBook(w http.ResponseWriter, r *http.Request) {
 		ExpiresAt:  time.Now().Add(time.Duration(minutes) * time.Minute),
 	}
 	if err := p.store.SaveBooking(booking); err != nil {
-		respondJSON(w, map[string]string{"ephemeral_text": "Ошибка: " + err.Error()})
+		respondJSON(w, &model.PostActionIntegrationResponse{EphemeralText: "Ошибка: " + err.Error()})
 		return
 	}
 
@@ -597,35 +591,49 @@ func (p *Plugin) handleActionBook(w http.ResponseWriter, r *http.Request) {
 	p.notifySubscribers(resourceID, fmt.Sprintf("🔒 **%s** занят @%s на %s",
 		res.Name, p.getUsername(userID), formatDuration(time.Duration(minutes)*time.Minute)), userID)
 
-	respondJSON(w, map[string]string{
-		"ephemeral_text": fmt.Sprintf("✅ Вы забронировали **%s** на %dм", res.Name, minutes),
+	respondJSON(w, &model.PostActionIntegrationResponse{
+		EphemeralText: fmt.Sprintf("✅ Вы забронировали **%s** на %dм (до %s)",
+			res.Name, minutes, booking.ExpiresAt.Format("15:04")),
 	})
 }
 
 func (p *Plugin) handleActionQueue(w http.ResponseWriter, r *http.Request) {
-	var req ActionRequest
+	var req model.PostActionIntegrationRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondJSON(w, map[string]string{"ephemeral_text": "Ошибка: " + err.Error()})
+		respondJSON(w, &model.PostActionIntegrationResponse{EphemeralText: "Ошибка: неверный запрос"})
 		return
 	}
 
-	userID := req.UserID
-	if userID == "" {
-		userID = r.Header.Get("Mattermost-User-ID")
-	}
-
+	userID := req.UserId
 	resourceID, _ := req.Context["resource_id"].(string)
 	minutesFloat, _ := req.Context["minutes"].(float64)
 	minutes := int(minutesFloat)
+	if minutes <= 0 {
+		minutes = 60
+	}
 
-	if resourceID == "" {
-		respondJSON(w, map[string]string{"ephemeral_text": "Неверные параметры"})
+	if resourceID == "" || userID == "" {
+		respondJSON(w, &model.PostActionIntegrationResponse{EphemeralText: "Ошибка: неверные параметры"})
 		return
 	}
 
 	res, err := p.store.GetResource(resourceID)
 	if err != nil || res == nil {
-		respondJSON(w, map[string]string{"ephemeral_text": "Ресурс не найден"})
+		respondJSON(w, &model.PostActionIntegrationResponse{EphemeralText: "Ресурс не найден"})
+		return
+	}
+
+	// If free, suggest booking
+	booking, _ := p.store.GetBooking(resourceID)
+	if booking == nil {
+		respondJSON(w, &model.PostActionIntegrationResponse{
+			EphemeralText: fmt.Sprintf("**%s** свободен! Используйте `/rq book %s 1h`", res.Name, res.Name),
+		})
+		return
+	}
+
+	if booking.UserID == userID {
+		respondJSON(w, &model.PostActionIntegrationResponse{EphemeralText: "Вы уже занимаете этот ресурс."})
 		return
 	}
 
@@ -637,19 +645,17 @@ func (p *Plugin) handleActionQueue(w http.ResponseWriter, r *http.Request) {
 
 	pos, err := p.store.AddToQueue(resourceID, entry)
 	if err != nil {
-		respondJSON(w, map[string]string{"ephemeral_text": "Ошибка: " + err.Error()})
+		respondJSON(w, &model.PostActionIntegrationResponse{EphemeralText: "Ошибка: " + err.Error()})
 		return
 	}
 
-	// Notify current holder
-	booking, _ := p.store.GetBooking(resourceID)
-	if booking != nil && !booking.NotifiedQueue {
+	if !booking.NotifiedQueue {
 		p.sendDM(booking.UserID, fmt.Sprintf("👋 @%s встал в очередь на **%s**", p.getUsername(userID), res.Name))
 		booking.NotifiedQueue = true
 		p.store.SaveBooking(booking)
 	}
 
-	respondJSON(w, map[string]string{
-		"ephemeral_text": fmt.Sprintf("✅ Вы в очереди на **%s** (позиция: %d)", res.Name, pos),
+	respondJSON(w, &model.PostActionIntegrationResponse{
+		EphemeralText: fmt.Sprintf("✅ Вы в очереди на **%s** (позиция: %d)", res.Name, pos),
 	})
 }

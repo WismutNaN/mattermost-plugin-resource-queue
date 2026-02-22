@@ -115,6 +115,15 @@ func (p *Plugin) getCheckIntervalSeconds() int {
 	return s
 }
 
+func (p *Plugin) getPluginURL() string {
+	siteURL := ""
+	cfg := p.API.GetConfig()
+	if cfg != nil && cfg.ServiceSettings.SiteURL != nil {
+		siteURL = *cfg.ServiceSettings.SiteURL
+	}
+	return siteURL + "/plugins/com.scientia.resource-queue"
+}
+
 // main is required for plugin
 func main() {
 	plugin.ClientMain(&Plugin{})
