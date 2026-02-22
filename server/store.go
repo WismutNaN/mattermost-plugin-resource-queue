@@ -4,18 +4,17 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
-	"time"
-
 	"github.com/mattermost/mattermost/server/public/plugin"
 )
 
 const (
-	keyResource     = "resource:%s"
-	keyResourceList = "resource_list"
-	keyBooking      = "booking:%s"
-	keyQueue        = "queue:%s"
-	keySubs         = "subs:%s"
-	keyHistory      = "history:%s"
+	keyResourceList = "res_list"
+	prefixResource  = "res:"
+	prefixBooking   = "bk:"
+	prefixQueue     = "q:"
+	prefixSubs      = "sub:"
+	prefixHistory   = "hist:"
+	keyBotUserID    = "bot_uid"
 )
 
 type Store struct {
@@ -26,222 +25,215 @@ func NewStore(api plugin.API) *Store {
 	return &Store{api: api}
 }
 
-// --- Resources ---
+// --- helpers ---
 
-func (s *Store) GetResourceList() ([]string, error) {
-	data, appErr := s.api.KVGet(keyResourceList)
+func (s *Store) get(key string, v interface{}) error {
+	data, appErr := s.api.KVGet(key)
 	if appErr != nil {
-		return nil, fmt.Errorf("KVGet resource_list: %v", appErr)
+		return fmt.Errorf("kvget %s: %v", key, appErr)
 	}
 	if data == nil {
-		return []string{}, nil
+		return nil // caller checks for zero value
 	}
+	return json.Unmarshal(data, v)
+}
+
+func (s *Store) set(key string, v interface{}) error {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+	if appErr := s.api.KVSet(key, data); appErr != nil {
+		return fmt.Errorf("kvset %s: %v", key, appErr)
+	}
+	return nil
+}
+
+func (s *Store) del(key string) {
+	s.api.KVDelete(key)
+}
+
+// --- Resource list ---
+
+func (s *Store) getResourceIDs() ([]string, error) {
 	var ids []string
-	if err := json.Unmarshal(data, &ids); err != nil {
+	if err := s.get(keyResourceList, &ids); err != nil {
 		return nil, err
 	}
 	return ids, nil
 }
 
-func (s *Store) setResourceList(ids []string) error {
-	data, _ := json.Marshal(ids)
-	if appErr := s.api.KVSet(keyResourceList, data); appErr != nil {
-		return fmt.Errorf("KVSet resource_list: %v", appErr)
-	}
-	return nil
+func (s *Store) setResourceIDs(ids []string) error {
+	return s.set(keyResourceList, ids)
 }
 
-func (s *Store) SaveResource(r *Resource) error {
-	data, _ := json.Marshal(r)
-	key := fmt.Sprintf(keyResource, r.ID)
-	if appErr := s.api.KVSet(key, data); appErr != nil {
-		return fmt.Errorf("KVSet resource: %v", appErr)
-	}
-	ids, _ := s.GetResourceList()
-	found := false
-	for _, id := range ids {
-		if id == r.ID {
-			found = true
-			break
-		}
-	}
-	if !found {
-		ids = append(ids, r.ID)
-		return s.setResourceList(ids)
-	}
-	return nil
-}
+// --- Resources ---
 
 func (s *Store) GetResource(id string) (*Resource, error) {
-	data, appErr := s.api.KVGet(fmt.Sprintf(keyResource, id))
-	if appErr != nil {
-		return nil, fmt.Errorf("KVGet resource %s: %v", id, appErr)
-	}
-	if data == nil {
-		return nil, nil
-	}
 	var r Resource
-	if err := json.Unmarshal(data, &r); err != nil {
+	if err := s.get(prefixResource+id, &r); err != nil {
 		return nil, err
+	}
+	if r.ID == "" {
+		return nil, nil
 	}
 	return &r, nil
 }
 
-func (s *Store) DeleteResource(id string) error {
-	s.api.KVDelete(fmt.Sprintf(keyResource, id))
-	s.api.KVDelete(fmt.Sprintf(keyBooking, id))
-	s.api.KVDelete(fmt.Sprintf(keyQueue, id))
-	s.api.KVDelete(fmt.Sprintf(keySubs, id))
-
-	ids, _ := s.GetResourceList()
-	newIDs := make([]string, 0, len(ids))
-	for _, eid := range ids {
-		if eid != id {
-			newIDs = append(newIDs, eid)
+func (s *Store) SaveResource(r *Resource) error {
+	if err := s.set(prefixResource+r.ID, r); err != nil {
+		return err
+	}
+	ids, _ := s.getResourceIDs()
+	for _, id := range ids {
+		if id == r.ID {
+			return nil
 		}
 	}
-	return s.setResourceList(newIDs)
+	if len(ids) >= maxResources {
+		return fmt.Errorf("max resources limit (%d) reached", maxResources)
+	}
+	ids = append(ids, r.ID)
+	return s.setResourceIDs(ids)
+}
+
+func (s *Store) DeleteResource(id string) error {
+	s.del(prefixResource + id)
+	s.del(prefixBooking + id)
+	s.del(prefixQueue + id)
+	s.del(prefixSubs + id)
+	s.del(prefixHistory + id)
+
+	ids, _ := s.getResourceIDs()
+	filtered := make([]string, 0, len(ids))
+	for _, eid := range ids {
+		if eid != id {
+			filtered = append(filtered, eid)
+		}
+	}
+	return s.setResourceIDs(filtered)
 }
 
 func (s *Store) GetAllResources() ([]*Resource, error) {
-	ids, err := s.GetResourceList()
+	ids, err := s.getResourceIDs()
 	if err != nil {
 		return nil, err
 	}
-	resources := make([]*Resource, 0, len(ids))
+	out := make([]*Resource, 0, len(ids))
 	for _, id := range ids {
 		r, err := s.GetResource(id)
-		if err != nil {
-			continue
-		}
-		if r != nil {
-			resources = append(resources, r)
+		if err == nil && r != nil {
+			out = append(out, r)
 		}
 	}
-	return resources, nil
+	return out, nil
 }
 
 // --- Bookings ---
 
+// GetBooking returns the active booking or nil. Does NOT auto-delete expired.
 func (s *Store) GetBooking(resourceID string) (*Booking, error) {
-	data, appErr := s.api.KVGet(fmt.Sprintf(keyBooking, resourceID))
-	if appErr != nil {
-		return nil, fmt.Errorf("KVGet booking: %v", appErr)
-	}
-	if data == nil {
-		return nil, nil
-	}
 	var b Booking
-	if err := json.Unmarshal(data, &b); err != nil {
+	if err := s.get(prefixBooking+resourceID, &b); err != nil {
 		return nil, err
 	}
-	// Return nil for expired bookings but DON'T delete — scheduler handles cleanup
-	if time.Now().After(b.ExpiresAt) {
+	if b.ResourceID == "" {
+		return nil, nil
+	}
+	if b.IsExpired() {
 		return nil, nil
 	}
 	return &b, nil
 }
 
-// GetBookingRaw returns booking even if expired (for scheduler to process expiry properly)
+// GetBookingRaw returns booking even if expired (for scheduler cleanup).
 func (s *Store) GetBookingRaw(resourceID string) (*Booking, error) {
-	data, appErr := s.api.KVGet(fmt.Sprintf(keyBooking, resourceID))
-	if appErr != nil {
-		return nil, fmt.Errorf("KVGet booking: %v", appErr)
-	}
-	if data == nil {
-		return nil, nil
-	}
 	var b Booking
-	if err := json.Unmarshal(data, &b); err != nil {
+	if err := s.get(prefixBooking+resourceID, &b); err != nil {
 		return nil, err
+	}
+	if b.ResourceID == "" {
+		return nil, nil
 	}
 	return &b, nil
 }
 
 func (s *Store) SaveBooking(b *Booking) error {
-	data, _ := json.Marshal(b)
-	if appErr := s.api.KVSet(fmt.Sprintf(keyBooking, b.ResourceID), data); appErr != nil {
-		return fmt.Errorf("KVSet booking: %v", appErr)
-	}
-	return nil
+	return s.set(prefixBooking+b.ResourceID, b)
 }
 
-func (s *Store) DeleteBooking(resourceID string) error {
-	if appErr := s.api.KVDelete(fmt.Sprintf(keyBooking, resourceID)); appErr != nil {
-		return fmt.Errorf("KVDelete booking: %v", appErr)
-	}
-	return nil
+func (s *Store) DeleteBooking(resourceID string) {
+	s.del(prefixBooking + resourceID)
 }
 
 // --- Queue ---
 
-func (s *Store) GetQueue(resourceID string) (*Queue, error) {
-	data, appErr := s.api.KVGet(fmt.Sprintf(keyQueue, resourceID))
-	if appErr != nil {
-		return nil, fmt.Errorf("KVGet queue: %v", appErr)
-	}
-	if data == nil {
-		return &Queue{ResourceID: resourceID, Entries: []QueueEntry{}}, nil
-	}
-	var q Queue
-	if err := json.Unmarshal(data, &q); err != nil {
+type queueData struct {
+	Entries []QueueEntry `json:"entries"`
+}
+
+func (s *Store) getQueue(resourceID string) (*queueData, error) {
+	var q queueData
+	if err := s.get(prefixQueue+resourceID, &q); err != nil {
 		return nil, err
+	}
+	if q.Entries == nil {
+		q.Entries = []QueueEntry{}
 	}
 	return &q, nil
 }
 
-func (s *Store) SaveQueue(q *Queue) error {
-	data, _ := json.Marshal(q)
-	if appErr := s.api.KVSet(fmt.Sprintf(keyQueue, q.ResourceID), data); appErr != nil {
-		return fmt.Errorf("KVSet queue: %v", appErr)
+func (s *Store) GetQueueEntries(resourceID string) ([]QueueEntry, error) {
+	q, err := s.getQueue(resourceID)
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	return q.Entries, nil
 }
 
 func (s *Store) AddToQueue(resourceID string, entry QueueEntry) (int, error) {
-	q, err := s.GetQueue(resourceID)
+	q, err := s.getQueue(resourceID)
 	if err != nil {
 		return 0, err
 	}
-	// Check if already in queue
 	for _, e := range q.Entries {
 		if e.UserID == entry.UserID {
 			return -1, fmt.Errorf("already in queue")
 		}
 	}
+	if len(q.Entries) >= maxQueueSize {
+		return -1, fmt.Errorf("queue is full (max %d)", maxQueueSize)
+	}
 	q.Entries = append(q.Entries, entry)
-	if err := s.SaveQueue(q); err != nil {
+	if err := s.set(prefixQueue+resourceID, q); err != nil {
 		return 0, err
 	}
 	return len(q.Entries), nil
 }
 
-func (s *Store) RemoveFromQueue(resourceID, userID string) error {
-	q, err := s.GetQueue(resourceID)
+func (s *Store) RemoveFromQueue(resourceID, userID string) {
+	q, err := s.getQueue(resourceID)
 	if err != nil {
-		return err
+		return
 	}
-	newEntries := make([]QueueEntry, 0)
+	filtered := make([]QueueEntry, 0, len(q.Entries))
 	for _, e := range q.Entries {
 		if e.UserID != userID {
-			newEntries = append(newEntries, e)
+			filtered = append(filtered, e)
 		}
 	}
-	q.Entries = newEntries
-	return s.SaveQueue(q)
+	q.Entries = filtered
+	s.set(prefixQueue+resourceID, q)
 }
 
 func (s *Store) PopQueue(resourceID string) (*QueueEntry, error) {
-	q, err := s.GetQueue(resourceID)
-	if err != nil {
+	q, err := s.getQueue(resourceID)
+	if err != nil || len(q.Entries) == 0 {
 		return nil, err
-	}
-	if len(q.Entries) == 0 {
-		return nil, nil
 	}
 	first := q.Entries[0]
 	q.Entries = q.Entries[1:]
-	if err := s.SaveQueue(q); err != nil {
+	if err := s.set(prefixQueue+resourceID, q); err != nil {
 		return nil, err
 	}
 	return &first, nil
@@ -249,87 +241,94 @@ func (s *Store) PopQueue(resourceID string) (*QueueEntry, error) {
 
 // --- Subscriptions ---
 
-func (s *Store) GetSubscribers(resourceID string) ([]string, error) {
-	data, appErr := s.api.KVGet(fmt.Sprintf(keySubs, resourceID))
-	if appErr != nil {
-		return nil, fmt.Errorf("KVGet subs: %v", appErr)
-	}
-	if data == nil {
-		return []string{}, nil
-	}
-	var sub Subscription
-	if err := json.Unmarshal(data, &sub); err != nil {
+type subsData struct {
+	UserIDs []string `json:"user_ids"`
+}
+
+func (s *Store) getSubs(resourceID string) (*subsData, error) {
+	var sd subsData
+	if err := s.get(prefixSubs+resourceID, &sd); err != nil {
 		return nil, err
 	}
-	return sub.UserIDs, nil
+	if sd.UserIDs == nil {
+		sd.UserIDs = []string{}
+	}
+	return &sd, nil
+}
+
+func (s *Store) GetSubscribers(resourceID string) ([]string, error) {
+	sd, err := s.getSubs(resourceID)
+	if err != nil {
+		return nil, err
+	}
+	return sd.UserIDs, nil
+}
+
+func (s *Store) IsSubscribed(resourceID, userID string) bool {
+	subs, _ := s.GetSubscribers(resourceID)
+	for _, uid := range subs {
+		if uid == userID {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Store) Subscribe(resourceID, userID string) error {
-	subs, _ := s.GetSubscribers(resourceID)
-	for _, uid := range subs {
+	sd, _ := s.getSubs(resourceID)
+	for _, uid := range sd.UserIDs {
 		if uid == userID {
 			return fmt.Errorf("already subscribed")
 		}
 	}
-	subs = append(subs, userID)
-	sub := Subscription{ResourceID: resourceID, UserIDs: subs}
-	data, _ := json.Marshal(sub)
-	if appErr := s.api.KVSet(fmt.Sprintf(keySubs, resourceID), data); appErr != nil {
-		return fmt.Errorf("KVSet subs: %v", appErr)
-	}
-	return nil
+	sd.UserIDs = append(sd.UserIDs, userID)
+	return s.set(prefixSubs+resourceID, sd)
 }
 
-func (s *Store) Unsubscribe(resourceID, userID string) error {
-	subs, _ := s.GetSubscribers(resourceID)
-	newSubs := make([]string, 0)
-	for _, uid := range subs {
+func (s *Store) Unsubscribe(resourceID, userID string) {
+	sd, _ := s.getSubs(resourceID)
+	filtered := make([]string, 0, len(sd.UserIDs))
+	for _, uid := range sd.UserIDs {
 		if uid != userID {
-			newSubs = append(newSubs, uid)
+			filtered = append(filtered, uid)
 		}
 	}
-	sub := Subscription{ResourceID: resourceID, UserIDs: newSubs}
-	data, _ := json.Marshal(sub)
-	if appErr := s.api.KVSet(fmt.Sprintf(keySubs, resourceID), data); appErr != nil {
-		return fmt.Errorf("KVSet subs: %v", appErr)
-	}
-	return nil
+	sd.UserIDs = filtered
+	s.set(prefixSubs+resourceID, sd)
 }
 
 // --- History ---
 
-func (s *Store) AddHistory(entry HistoryEntry) error {
-	h, err := s.GetHistory(entry.ResourceID)
-	if err != nil {
-		h = &History{ResourceID: entry.ResourceID, Entries: []HistoryEntry{}}
-	}
-	h.Entries = append(h.Entries, entry)
-	// Keep last 500 entries
-	if len(h.Entries) > 500 {
-		h.Entries = h.Entries[len(h.Entries)-500:]
-	}
-	data, _ := json.Marshal(h)
-	if appErr := s.api.KVSet(fmt.Sprintf(keyHistory, entry.ResourceID), data); appErr != nil {
-		return fmt.Errorf("KVSet history: %v", appErr)
-	}
-	return nil
+type historyData struct {
+	Entries []HistoryEntry `json:"entries"`
 }
 
-func (s *Store) GetHistory(resourceID string) (*History, error) {
-	data, appErr := s.api.KVGet(fmt.Sprintf(keyHistory, resourceID))
-	if appErr != nil {
-		return nil, fmt.Errorf("KVGet history: %v", appErr)
+func (s *Store) AddHistory(entry HistoryEntry) error {
+	var h historyData
+	s.get(prefixHistory+entry.ResourceID, &h)
+	if h.Entries == nil {
+		h.Entries = []HistoryEntry{}
 	}
-	if data == nil {
-		return &History{ResourceID: resourceID, Entries: []HistoryEntry{}}, nil
+	h.Entries = append(h.Entries, entry)
+	if len(h.Entries) > maxHistory {
+		h.Entries = h.Entries[len(h.Entries)-maxHistory:]
 	}
-	var h History
-	if err := json.Unmarshal(data, &h); err != nil {
+	return s.set(prefixHistory+entry.ResourceID, &h)
+}
+
+func (s *Store) GetHistory(resourceID string, limit int) ([]HistoryEntry, error) {
+	var h historyData
+	if err := s.get(prefixHistory+resourceID, &h); err != nil {
 		return nil, err
 	}
-	// Sort by started_at desc
+	if h.Entries == nil {
+		return []HistoryEntry{}, nil
+	}
 	sort.Slice(h.Entries, func(i, j int) bool {
 		return h.Entries[i].StartedAt.After(h.Entries[j].StartedAt)
 	})
-	return &h, nil
+	if limit > 0 && len(h.Entries) > limit {
+		h.Entries = h.Entries[:limit]
+	}
+	return h.Entries, nil
 }

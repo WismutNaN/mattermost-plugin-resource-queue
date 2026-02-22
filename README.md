@@ -32,7 +32,7 @@ go mod tidy
 build.bat
 ```
 
-Результат: `com.scientia.resource-queue-0.1.0.tar.gz`
+Результат: `com.scientia.resource-queue-1.0.1.tar.gz`
 
 ### Сборка (Linux/macOS)
 
@@ -65,7 +65,7 @@ go run pack.go
 ## Установка
 
 1. **System Console → Plugin Management → Upload Plugin**
-2. Загрузить `com.scientia.resource-queue-0.1.0.tar.gz`
+2. Загрузить `com.scientia.resource-queue-1.0.1.tar.gz`
 3. Активировать плагин
 4. Настроить параметры в **System Console → Plugins → Resource Queue**
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/gorilla/mux"
@@ -13,68 +14,33 @@ import (
 
 type Plugin struct {
 	plugin.MattermostPlugin
-	configurationLock sync.RWMutex
-	store             *Store
-	router            *mux.Router
-	scheduler         *Scheduler
-	botUserID         string
+	mu        sync.RWMutex
+	store     *Store
+	router    *mux.Router
+	scheduler *Scheduler
+	botUserID string
 }
 
 func (p *Plugin) OnActivate() error {
 	p.store = NewStore(p.API)
 
-	// Create or get bot account
-	botUserID, err := p.ensureBot()
+	botID, err := p.ensureBot()
 	if err != nil {
-		p.API.LogError("Failed to ensure bot", "error", err.Error())
-		return err
+		return fmt.Errorf("ensure bot: %w", err)
 	}
-	p.botUserID = botUserID
+	p.botUserID = botID
 
-	// Register commands
 	if err := p.registerCommands(); err != nil {
-		return err
+		return fmt.Errorf("register commands: %w", err)
 	}
 
-	// Setup HTTP router
 	p.router = mux.NewRouter()
-	p.setupAPI()
+	p.initRoutes()
 
-	// Start scheduler
 	p.scheduler = NewScheduler(p)
 	p.scheduler.Start()
 
 	return nil
-}
-
-func (p *Plugin) ensureBot() (string, error) {
-	// Check if we already stored the bot ID
-	if data, appErr := p.API.KVGet("bot_user_id"); appErr == nil && len(data) > 0 {
-		botUserID := string(data)
-		// Verify bot still exists
-		if user, uErr := p.API.GetUser(botUserID); uErr == nil && user != nil {
-			return botUserID, nil
-		}
-	}
-
-	// Try to find existing bot user by username
-	user, appErr := p.API.GetUserByUsername("resource-queue")
-	if appErr == nil && user != nil {
-		p.API.KVSet("bot_user_id", []byte(user.Id))
-		return user.Id, nil
-	}
-
-	// Create new bot
-	newBot, createErr := p.API.CreateBot(&model.Bot{
-		Username:    "resource-queue",
-		DisplayName: "Resource Queue",
-		Description: "Resource Queue Bot",
-	})
-	if createErr != nil {
-		return "", fmt.Errorf("create bot: %v", createErr)
-	}
-	p.API.KVSet("bot_user_id", []byte(newBot.UserId))
-	return newBot.UserId, nil
 }
 
 func (p *Plugin) OnDeactivate() error {
@@ -88,43 +54,66 @@ func (p *Plugin) ServeHTTP(c *plugin.Context, w http.ResponseWriter, r *http.Req
 	p.router.ServeHTTP(w, r)
 }
 
-func (p *Plugin) getNotifyBeforeMinutes() int {
-	cfg := p.getConfiguration()
-	m, err := strconv.Atoi(cfg.NotifyBeforeMinutes)
-	if err != nil || m <= 0 {
-		return 10
+func (p *Plugin) ensureBot() (string, error) {
+	if data, appErr := p.API.KVGet(keyBotUserID); appErr == nil && len(data) > 0 {
+		uid := string(data)
+		if u, e := p.API.GetUser(uid); e == nil && u != nil {
+			return uid, nil
+		}
 	}
-	return m
+	if u, e := p.API.GetUserByUsername(botUsername); e == nil && u != nil {
+		p.API.KVSet(keyBotUserID, []byte(u.Id))
+		return u.Id, nil
+	}
+	bot, err := p.API.CreateBot(&model.Bot{
+		Username:    botUsername,
+		DisplayName: "Resource Queue",
+		Description: "Manages shared resource bookings",
+	})
+	if err != nil {
+		return "", fmt.Errorf("CreateBot: %v", err)
+	}
+	p.API.KVSet(keyBotUserID, []byte(bot.UserId))
+	return bot.UserId, nil
 }
 
-func (p *Plugin) getMaxBookingHours() int {
-	cfg := p.getConfiguration()
-	h, err := strconv.Atoi(cfg.MaxBookingHours)
-	if err != nil || h <= 0 {
-		return 24
-	}
-	return h
+// --- config helpers ---
+
+type configuration struct {
+	EnablePlugin         bool   `json:"EnablePlugin"`
+	NotifyBeforeMinutes  string `json:"NotifyBeforeMinutes"`
+	MaxBookingHours      string `json:"MaxBookingHours"`
+	CheckIntervalSeconds string `json:"CheckIntervalSeconds"`
 }
 
-func (p *Plugin) getCheckIntervalSeconds() int {
-	cfg := p.getConfiguration()
-	s, err := strconv.Atoi(cfg.CheckIntervalSeconds)
-	if err != nil || s <= 0 {
-		return 30
-	}
-	return s
+func (p *Plugin) getConfig() *configuration {
+	cfg := &configuration{NotifyBeforeMinutes: "10", MaxBookingHours: "24", CheckIntervalSeconds: "30"}
+	_ = p.API.LoadPluginConfiguration(cfg)
+	return cfg
 }
 
-func (p *Plugin) getPluginURL() string {
-	siteURL := ""
-	cfg := p.API.GetConfig()
-	if cfg != nil && cfg.ServiceSettings.SiteURL != nil {
-		siteURL = *cfg.ServiceSettings.SiteURL
+func (p *Plugin) cfgNotifyMinutes() int  { v, _ := strconv.Atoi(p.getConfig().NotifyBeforeMinutes); if v <= 0 { return 10 }; return v }
+func (p *Plugin) cfgMaxBookingHours() int { v, _ := strconv.Atoi(p.getConfig().MaxBookingHours); if v <= 0 { return 24 }; return v }
+func (p *Plugin) cfgCheckSeconds() int   { v, _ := strconv.Atoi(p.getConfig().CheckIntervalSeconds); if v <= 0 { return 30 }; return v }
+
+// --- user helpers ---
+
+func (p *Plugin) isAdmin(userID string) bool {
+	u, err := p.API.GetUser(userID)
+	if err != nil {
+		return false
 	}
-	return siteURL + "/plugins/com.scientia.resource-queue"
+	return strings.Contains(u.Roles, "system_admin")
 }
 
-// main is required for plugin
+func (p *Plugin) username(userID string) string {
+	u, err := p.API.GetUser(userID)
+	if err != nil {
+		return "unknown"
+	}
+	return u.Username
+}
+
 func main() {
 	plugin.ClientMain(&Plugin{})
 }

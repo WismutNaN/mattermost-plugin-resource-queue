@@ -2,7 +2,20 @@ package main
 
 import "time"
 
-// Resource represents a managed resource (PC, server, service)
+const (
+	pluginID     = "com.scientia.resource-queue"
+	botUsername  = "resource-queue"
+	maxHistory   = 200
+	maxQueueSize = 50
+	maxResources = 100
+	maxVarKeyLen = 64
+	maxVarValLen = 256
+	maxNameLen   = 100
+	maxIPLen     = 45 // IPv6
+	maxDescLen   = 500
+	maxPurposeLen = 200
+)
+
 type Resource struct {
 	ID          string            `json:"id"`
 	Name        string            `json:"name"`
@@ -14,7 +27,6 @@ type Resource struct {
 	CreatedBy   string            `json:"created_by"`
 }
 
-// Booking represents an active resource booking
 type Booking struct {
 	ResourceID    string    `json:"resource_id"`
 	UserID        string    `json:"user_id"`
@@ -25,7 +37,10 @@ type Booking struct {
 	NotifiedQueue bool      `json:"notified_queue"`
 }
 
-// QueueEntry represents a user waiting in queue for a resource
+func (b *Booking) IsExpired() bool {
+	return time.Now().After(b.ExpiresAt)
+}
+
 type QueueEntry struct {
 	UserID          string        `json:"user_id"`
 	DesiredDuration time.Duration `json:"desired_duration"`
@@ -33,19 +48,6 @@ type QueueEntry struct {
 	QueuedAt        time.Time     `json:"queued_at"`
 }
 
-// Queue is a list of queue entries
-type Queue struct {
-	ResourceID string       `json:"resource_id"`
-	Entries    []QueueEntry `json:"entries"`
-}
-
-// Subscription tracks users subscribed to resource status changes
-type Subscription struct {
-	ResourceID string   `json:"resource_id"`
-	UserIDs    []string `json:"user_ids"`
-}
-
-// HistoryEntry records past bookings
 type HistoryEntry struct {
 	UserID     string    `json:"user_id"`
 	ResourceID string    `json:"resource_id"`
@@ -54,13 +56,18 @@ type HistoryEntry struct {
 	EndedAt    time.Time `json:"ended_at"`
 }
 
-// History stores history entries (chunked by resource)
-type History struct {
-	ResourceID string         `json:"resource_id"`
-	Entries    []HistoryEntry `json:"entries"`
+// API response types
+
+type BookingView struct {
+	Booking
+	Username string `json:"username"`
 }
 
-// ResourceStatus is a combined view for API responses
+type QueueView struct {
+	QueueEntry
+	Username string `json:"username"`
+}
+
 type ResourceStatus struct {
 	Resource     Resource     `json:"resource"`
 	Booking      *BookingView `json:"booking,omitempty"`
@@ -71,19 +78,12 @@ type ResourceStatus struct {
 	InQueue      bool         `json:"in_queue"`
 }
 
-// BookingView is Booking with resolved username
-type BookingView struct {
-	Booking
-	Username string `json:"username"`
+type StatusResponse struct {
+	UserID   string           `json:"user_id"`
+	IsAdmin  bool             `json:"is_admin"`
+	Statuses []ResourceStatus `json:"statuses"`
 }
 
-// QueueView is QueueEntry with resolved username
-type QueueView struct {
-	QueueEntry
-	Username string `json:"username"`
-}
-
-// Duration presets for the UI
 type DurationPreset struct {
 	Label   string `json:"label"`
 	Minutes int    `json:"minutes"`
@@ -95,5 +95,4 @@ var DefaultPresets = []DurationPreset{
 	{Label: "2 часа", Minutes: 120},
 	{Label: "4 часа", Minutes: 240},
 	{Label: "8 часов", Minutes: 480},
-	{Label: "До конца дня", Minutes: 600},
 }

@@ -1,5 +1,5 @@
 PLUGIN_ID ?= com.scientia.resource-queue
-PLUGIN_VERSION ?= 0.1.0
+PLUGIN_VERSION ?= 1.0.1
 BUNDLE_NAME ?= $(PLUGIN_ID)-$(PLUGIN_VERSION).tar.gz
 
 GO_PLATFORMS = linux-amd64 linux-arm64 darwin-amd64 darwin-arm64 windows-amd64

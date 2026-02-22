@@ -7,28 +7,27 @@ import (
 	"github.com/mattermost/mattermost/server/public/model"
 )
 
-func (p *Plugin) sendDM(userID, message string) {
-	channel, appErr := p.API.GetDirectChannel(p.botUserID, userID)
-	if appErr != nil {
-		p.API.LogError("Failed to get DM channel", "user_id", userID, "error", appErr.Error())
+func (p *Plugin) sendDM(userID, text string) {
+	channel, err := p.API.GetDirectChannel(userID, p.botUserID)
+	if err != nil {
+		p.API.LogWarn("sendDM: GetDirectChannel", "user", userID, "err", err.Error())
 		return
 	}
-
 	post := &model.Post{
 		UserId:    p.botUserID,
 		ChannelId: channel.Id,
-		Message:   message,
+		Message:   text,
 	}
-	if _, appErr := p.API.CreatePost(post); appErr != nil {
-		p.API.LogError("Failed to send DM", "user_id", userID, "error", appErr.Error())
+	if _, err := p.API.CreatePost(post); err != nil {
+		p.API.LogWarn("sendDM: CreatePost", "user", userID, "err", err.Error())
 	}
 }
 
-func (p *Plugin) notifySubscribers(resourceID, message, excludeUserID string) {
+func (p *Plugin) notifySubscribers(resourceID, text, excludeUserID string) {
 	subs, _ := p.store.GetSubscribers(resourceID)
 	for _, uid := range subs {
 		if uid != excludeUserID {
-			p.sendDM(uid, message)
+			p.sendDM(uid, text)
 		}
 	}
 }
@@ -38,45 +37,33 @@ func (p *Plugin) processQueue(resourceID, resourceName string) {
 	if err != nil || entry == nil {
 		return
 	}
-
-	p.sendDM(entry.UserID, fmt.Sprintf("🎉 **%s** теперь свободен! Вы следующий в очереди. Забронируйте его командой:\n`/rq book %s %s`",
-		resourceName, resourceID, formatDuration(entry.DesiredDuration)))
+	p.sendDM(entry.UserID, fmt.Sprintf(
+		"🎉 **%s** свободен! Вы следующий в очереди.\nИспользуйте `/rq book %s %s` чтобы занять.",
+		resourceName, resourceName, formatDuration(entry.DesiredDuration)))
 }
 
-func (p *Plugin) getUsername(userID string) string {
-	user, appErr := p.API.GetUser(userID)
-	if appErr != nil {
-		return "unknown"
-	}
-	return user.Username
-}
+// --- formatting ---
 
 func formatDuration(d time.Duration) string {
-	if d < time.Hour {
-		return fmt.Sprintf("%dм", int(d.Minutes()))
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	if h > 0 && m > 0 {
+		return fmt.Sprintf("%dh%dm", h, m)
 	}
-	hours := int(d.Hours())
-	mins := int(d.Minutes()) % 60
-	if mins == 0 {
-		return fmt.Sprintf("%dч", hours)
+	if h > 0 {
+		return fmt.Sprintf("%dh", h)
 	}
-	return fmt.Sprintf("%dч%dм", hours, mins)
+	return fmt.Sprintf("%dm", m)
 }
 
 func formatTimeLeft(d time.Duration) string {
-	if d < 0 {
-		return "истекло"
+	if d <= 0 {
+		return "истекает"
 	}
-	if d < time.Minute {
-		return fmt.Sprintf("%d сек", int(d.Seconds()))
+	h := int(d.Hours())
+	m := int(d.Minutes()) % 60
+	if h > 0 {
+		return fmt.Sprintf("%dч%02dм", h, m)
 	}
-	if d < time.Hour {
-		return fmt.Sprintf("%d мин", int(d.Minutes()))
-	}
-	hours := int(d.Hours())
-	mins := int(d.Minutes()) % 60
-	if mins == 0 {
-		return fmt.Sprintf("%d ч", hours)
-	}
-	return fmt.Sprintf("%d ч %d мин", hours, mins)
+	return fmt.Sprintf("%dм", m)
 }

@@ -8,12 +8,14 @@ import (
 type Scheduler struct {
 	plugin *Plugin
 	stop   chan struct{}
+	done   chan struct{}
 }
 
 func NewScheduler(p *Plugin) *Scheduler {
 	return &Scheduler{
 		plugin: p,
 		stop:   make(chan struct{}),
+		done:   make(chan struct{}),
 	}
 }
 
@@ -23,49 +25,51 @@ func (s *Scheduler) Start() {
 
 func (s *Scheduler) Stop() {
 	close(s.stop)
+	<-s.done // wait for goroutine to exit
 }
 
 func (s *Scheduler) run() {
-	interval := time.Duration(s.plugin.getCheckIntervalSeconds()) * time.Second
+	defer close(s.done)
+
+	interval := time.Duration(s.plugin.cfgCheckSeconds()) * time.Second
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			s.checkBookings()
+			s.tick()
 		case <-s.stop:
 			return
 		}
 	}
 }
 
-func (s *Scheduler) checkBookings() {
-	ids, err := s.plugin.store.GetResourceList()
+func (s *Scheduler) tick() {
+	ids, err := s.plugin.store.getResourceIDs()
 	if err != nil {
 		return
 	}
 
-	notifyBefore := time.Duration(s.plugin.getNotifyBeforeMinutes()) * time.Minute
+	notifyBefore := time.Duration(s.plugin.cfgNotifyMinutes()) * time.Minute
 
 	for _, id := range ids {
+		// Use Raw to see expired bookings before cleanup
 		booking, err := s.plugin.store.GetBookingRaw(id)
 		if err != nil || booking == nil {
 			continue
 		}
 
 		res, _ := s.plugin.store.GetResource(id)
-		resName := id
+		name := id
 		if res != nil {
-			resName = res.Name
+			name = res.Name
 		}
 
-		now := time.Now()
-		timeLeft := booking.ExpiresAt.Sub(now)
+		left := time.Until(booking.ExpiresAt)
 
-		// Check if expired
-		if timeLeft <= 0 {
-			// Auto-release
+		if left <= 0 {
+			// Expired — auto-release
 			s.plugin.store.AddHistory(HistoryEntry{
 				UserID:     booking.UserID,
 				ResourceID: id,
@@ -74,16 +78,19 @@ func (s *Scheduler) checkBookings() {
 				EndedAt:    booking.ExpiresAt,
 			})
 			s.plugin.store.DeleteBooking(id)
-			s.plugin.sendDM(booking.UserID, fmt.Sprintf("⏰ Время бронирования **%s** истекло. Ресурс освобождён.", resName))
-			s.plugin.notifySubscribers(id, fmt.Sprintf("🔓 **%s** освобождён (время истекло)", resName), "")
-			s.plugin.processQueue(id, resName)
+			s.plugin.sendDM(booking.UserID,
+				fmt.Sprintf("⏰ Время бронирования **%s** истекло. Ресурс освобождён.", name))
+			s.plugin.notifySubscribers(id,
+				fmt.Sprintf("🔓 **%s** освобождён (время истекло)", name), "")
+			s.plugin.processQueue(id, name)
 			continue
 		}
 
-		// Notify soon expiry
-		if timeLeft <= notifyBefore && !booking.NotifiedSoon {
-			s.plugin.sendDM(booking.UserID, fmt.Sprintf("⚠️ Бронирование **%s** истечёт через %s. Используйте `/rq release %s` чтобы освободить или `/rq extend %s <время>` чтобы продлить.",
-				resName, formatTimeLeft(timeLeft), id, id))
+		// Warn before expiry
+		if left <= notifyBefore && !booking.NotifiedSoon {
+			s.plugin.sendDM(booking.UserID,
+				fmt.Sprintf("⚠️ Бронирование **%s** истечёт через %s. `/rq extend %s <время>` чтобы продлить.",
+					name, formatTimeLeft(left), name))
 			booking.NotifiedSoon = true
 			s.plugin.store.SaveBooking(booking)
 		}
